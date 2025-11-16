@@ -1,0 +1,79 @@
+name: Main PR Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-nbd-server:
+    # Job name now includes the build profile (debug/release)
+    name: Test on ${{ matrix.os }} / Rust ${{ matrix.rust }} / ${{ matrix.profile }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # Prevents all jobs from being cancelled if one configuration fails,
+      # ensuring you get test results for all Linux versions.
+      fail-fast: false
+      matrix:
+        # Define the different Linux distributions (runners) to test on
+        os: [ubuntu-24.04, ubuntu-22.04]
+        # Define the different Rust stable toolchains to test against
+        rust: [stable, '1.91.1']
+        # Define the build profiles
+        profile: [debug, release]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain ${{ matrix.rust }}
+      # Sets up the specified Rust version and adds core components
+      uses: dtolnay/rust-toolchain@v1
+      with:
+        toolchain: ${{ matrix.rust }}
+        components: rustfmt, clippy
+
+    - name: Cache Cargo dependencies
+      # Caches built dependencies to speed up subsequent runs
+      # The cache key now includes the profile to separate debug/release caches
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-${{ matrix.rust }}-${{ matrix.profile }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install NBD client tools
+      # NBD integration tests typically require the 'nbd-client' package
+      # and often elevated privileges for interacting with kernel modules.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y nbd-client
+
+    - name: Check Formatting
+      # Ensure all code matches the standard Rust format
+      # This step is profile-independent and only needs to run once.
+      run: cargo fmt --all -- --check
+
+    - name: Run Linter (Clippy)
+      # Run clippy with the correct profile and fail on any warnings
+      run: |
+        if [ "${{ matrix.profile }}" = "release" ]; then
+          cargo clippy --all-targets --verbose --release -- -D warnings
+        else
+          cargo clippy --all-targets --verbose -- -D warnings
+        fi
+
+    - name: Run Integration Tests (with elevated privileges)
+      # We use 'sudo cargo test' because connecting an NBD client to the server
+      # usually requires administrative rights to set up the kernel block device.
+      # This now runs with or without the --release flag based on the matrix.
+      run: |
+        if [ "${{ matrix.profile }}" = "release" ]; then
+          sudo -E $CARGO_HOME/bin/cargo test --verbose --release
+        else
+          sudo -E $CARGO_HOME/bin/cargo test --verbose
+        fi
