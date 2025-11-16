@@ -53,29 +53,29 @@ pub enum NbdMessage {
 
     // --- Transmission Phase ---
     CmdRead {
-        handle: u64,
+        cookie: u64,
         offset: u64,
         length: u32,
     },
     CmdWrite {
-        handle: u64,
+        cookie: u64,
         offset: u64,
         data: Bytes,
     },
     CmdDisc {
-        handle: u64,
+        cookie: u64,
     },
     CmdFlush {
-        handle: u64,
+        cookie: u64,
     },
     CmdTrim {
-        handle: u64,
+        cookie: u64,
         offset: u64,
         length: u32,
     },
     CmdReply {
         error: u32,
-        handle: u64,
+        cookie: u64,
         data: Option<Bytes>,
     },
 }
@@ -84,7 +84,7 @@ pub struct NbdCodec {
     state: SessionState,
     /// We must store the length of pending READ requests
     /// to know how much data to expect in a CmdReply.
-    /// Key: handle, Value: length
+    /// Key: cookie, Value: length
     pending_reads: HashMap<u64, u32>,
 }
 
@@ -187,7 +187,7 @@ impl Encoder<NbdMessage> for NbdCodec {
 
             // --- Transmission: Requests ---
             NbdMessage::CmdRead {
-                handle,
+                cookie,
                 offset,
                 length,
             } => {
@@ -195,15 +195,15 @@ impl Encoder<NbdMessage> for NbdCodec {
                 dst.put_u32(NBD_REQUEST_MAGIC); // 4
                 dst.put_u16(0); // flags (2)
                 dst.put_u16(NBD_CMD_READ); // type (2)
-                dst.put_u64(handle); // 8
+                dst.put_u64(cookie); // 8
                 dst.put_u64(offset); // 8
                 dst.put_u32(length); // 4
                 // A client must remember this!
-                debug!(?handle, length, "Encoder: Storing pending read");
-                self.pending_reads.insert(handle, length);
+                debug!(?cookie, length, "Encoder: Storing pending read");
+                self.pending_reads.insert(cookie, length);
             }
             NbdMessage::CmdWrite {
-                handle,
+                cookie,
                 offset,
                 data,
             } => {
@@ -212,31 +212,31 @@ impl Encoder<NbdMessage> for NbdCodec {
                 dst.put_u32(NBD_REQUEST_MAGIC); // 4
                 dst.put_u16(0); // flags (2)
                 dst.put_u16(NBD_CMD_WRITE); // type (2)
-                dst.put_u64(handle); // 8
+                dst.put_u64(cookie); // 8
                 dst.put_u64(offset); // 8
                 dst.put_u32(length); // 4
                 dst.put_slice(&data);
             }
-            NbdMessage::CmdDisc { handle } => {
+            NbdMessage::CmdDisc { cookie } => {
                 dst.reserve(28);
                 dst.put_u32(NBD_REQUEST_MAGIC); // 4
                 dst.put_u16(0); // flags (2)
                 dst.put_u16(NBD_CMD_DISC); // type (2)
-                dst.put_u64(handle); // 8
+                dst.put_u64(cookie); // 8
                 dst.put_u64(0); // offset (8)
                 dst.put_u32(0); // length (4)
             }
-            NbdMessage::CmdFlush { handle } => {
+            NbdMessage::CmdFlush { cookie } => {
                 dst.reserve(28);
                 dst.put_u32(NBD_REQUEST_MAGIC);
                 dst.put_u16(0);
                 dst.put_u16(NBD_CMD_FLUSH);
-                dst.put_u64(handle);
+                dst.put_u64(cookie);
                 dst.put_u64(0);
                 dst.put_u32(0);
             }
             NbdMessage::CmdTrim {
-                handle,
+                cookie,
                 offset,
                 length,
             } => {
@@ -244,7 +244,7 @@ impl Encoder<NbdMessage> for NbdCodec {
                 dst.put_u32(NBD_REQUEST_MAGIC);
                 dst.put_u16(0);
                 dst.put_u16(NBD_CMD_TRIM);
-                dst.put_u64(handle);
+                dst.put_u64(cookie);
                 dst.put_u64(offset);
                 dst.put_u32(length);
             }
@@ -252,13 +252,13 @@ impl Encoder<NbdMessage> for NbdCodec {
             // --- Transmission: Replies ---
             NbdMessage::CmdReply {
                 error,
-                handle,
+                cookie,
                 data,
             } => {
                 dst.reserve(16);
                 dst.put_u32(NBD_REPLY_MAGIC); // 4
                 dst.put_u32(error); // 4
-                dst.put_u64(handle); // 8
+                dst.put_u64(cookie); // 8
                 if let Some(data) = data {
                     // This is a READ reply. Data is sent immediately after.
                     dst.put_slice(&data);
@@ -513,13 +513,13 @@ impl Decoder for NbdCodec {
                     let _magic = header.get_u32();
                     let flags = header.get_u16();
                     let cmd_type = header.get_u16();
-                    let handle = header.get_u64();
+                    let cookie = header.get_u64();
                     let offset = header.get_u64();
                     let length = header.get_u32();
                     debug!(
                         ?flags,
                         ?cmd_type,
-                        ?handle,
+                        ?cookie,
                         ?offset,
                         ?length,
                         "Transmission: Parsed Request Header"
@@ -539,10 +539,10 @@ impl Decoder for NbdCodec {
                     match cmd_type {
                         NBD_CMD_READ => {
                             // Server must remember this read to send reply
-                            debug!(?handle, ?length, "Transmission: Storing pending read");
-                            self.pending_reads.insert(handle, length);
+                            debug!(?cookie, ?length, "Transmission: Storing pending read");
+                            self.pending_reads.insert(cookie, length);
                             Ok(Some(NbdMessage::CmdRead {
-                                handle,
+                                cookie,
                                 offset,
                                 length,
                             }))
@@ -558,20 +558,20 @@ impl Decoder for NbdCodec {
                             }
                             let data = src.split_to(length as usize).freeze();
                             debug!(
-                                ?handle,
+                                ?cookie,
                                 "Transmission: Parsed Write payload ({} bytes)",
                                 data.len()
                             );
                             Ok(Some(NbdMessage::CmdWrite {
-                                handle,
+                                cookie,
                                 offset,
                                 data,
                             }))
                         }
-                        NBD_CMD_DISC => Ok(Some(NbdMessage::CmdDisc { handle })),
-                        NBD_CMD_FLUSH => Ok(Some(NbdMessage::CmdFlush { handle })),
+                        NBD_CMD_DISC => Ok(Some(NbdMessage::CmdDisc { cookie })),
+                        NBD_CMD_FLUSH => Ok(Some(NbdMessage::CmdFlush { cookie })),
                         NBD_CMD_TRIM => Ok(Some(NbdMessage::CmdTrim {
-                            handle,
+                            cookie,
                             offset,
                             length,
                         })),
@@ -593,12 +593,12 @@ impl Decoder for NbdCodec {
                     let mut header = src.split_to(16);
                     header.advance(4); // Skip magic
                     let error = header.get_u32();
-                    let handle = header.get_u64();
-                    debug!(?error, ?handle, "Transmission: Parsed Reply Header");
+                    let cookie = header.get_u64();
+                    debug!(?error, ?cookie, "Transmission: Parsed Reply Header");
 
                     // Was this a READ reply?
-                    if let Some(length) = self.pending_reads.remove(&handle) {
-                        debug!(?handle, ?length, "Transmission: Identified READ reply");
+                    if let Some(length) = self.pending_reads.remove(&cookie) {
+                        debug!(?cookie, ?length, "Transmission: Identified READ reply");
                         // Yes. We must wait for the data payload.
                         if src.len() < length as usize {
                             trace!(
@@ -607,18 +607,18 @@ impl Decoder for NbdCodec {
                                 src.len()
                             );
                             // Put length back in case we don't have enough data
-                            self.pending_reads.insert(handle, length);
+                            self.pending_reads.insert(cookie, length);
                             return Ok(None); // Need read payload
                         }
                         let data = if error == 0 {
                             debug!(
-                                ?handle,
+                                ?cookie,
                                 "Transmission: Parsed READ reply payload ({} bytes)", length
                             );
                             Some(src.split_to(length as usize).freeze())
                         } else {
                             error!(
-                                ?handle,
+                                ?cookie,
                                 ?error,
                                 "Transmission: READ reply has error, no data payload"
                             );
@@ -626,18 +626,18 @@ impl Decoder for NbdCodec {
                         };
                         Ok(Some(NbdMessage::CmdReply {
                             error,
-                            handle,
+                            cookie,
                             data,
                         }))
                     } else {
-                        debug!(?handle, "Transmission: Identified non-READ reply");
+                        debug!(?cookie, "Transmission: Identified non-READ reply");
                         if error != 0 {
-                            warn!(?handle, ?error, "Transmission: Non-READ reply has error");
+                            warn!(?cookie, ?error, "Transmission: Non-READ reply has error");
                         }
                         // No. This was a reply for WRITE, FLUSH, etc. No data follows.
                         Ok(Some(NbdMessage::CmdReply {
                             error,
-                            handle,
+                            cookie,
                             data: None,
                         }))
                     }
@@ -753,7 +753,7 @@ mod tests {
 
         // Client encodes a READ request
         let read_req = NbdMessage::CmdRead {
-            handle: 0x11223344,
+            cookie: 0x11223344,
             offset: 1024,
             length: 512,
         };
@@ -761,7 +761,7 @@ mod tests {
             .encode(read_req.clone(), &mut client_buf)
             .unwrap();
 
-        // Check that client is now expecting a reply for this handle
+        // Check that client is now expecting a reply for this cookie
         assert_eq!(client_codec.pending_reads.get(&0x11223344), Some(&512));
 
         // --- Server perspective ---
@@ -777,7 +777,7 @@ mod tests {
         let reply_data = Bytes::from(vec![0xAA; 512]);
         let reply_msg = NbdMessage::CmdReply {
             error: 0,
-            handle: 0x11223344,
+            cookie: 0x11223344,
             data: Some(reply_data.clone()),
         };
         let mut server_buf = BytesMut::new();
@@ -804,7 +804,7 @@ mod tests {
         // Client encodes a WRITE request
         let write_data = Bytes::from(vec![0xBB; 256]);
         let write_req = NbdMessage::CmdWrite {
-            handle: 0x44556677,
+            cookie: 0x44556677,
             offset: 2048,
             data: write_data.clone(),
         };
@@ -827,7 +827,7 @@ mod tests {
         // --- Server encodes a simple "OK" reply (no data) ---
         let reply_msg = NbdMessage::CmdReply {
             error: 0,
-            handle: 0x44556677,
+            cookie: 0x44556677,
             data: None,
         };
         let mut server_buf = BytesMut::new();

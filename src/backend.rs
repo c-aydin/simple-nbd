@@ -26,7 +26,7 @@ impl NbdBackend for MemoryBackend {
 
     fn handle_request(&mut self, req: &NbdRequest) -> impl Future<Output = NbdReply> + Send {
         tracing::trace!(
-            handle = req.handle,
+            cookie = req.cookie,
             "Handling request in MemoryBackend: {:?}",
             req.request_type
         );
@@ -38,7 +38,7 @@ impl NbdBackend for MemoryBackend {
             _ => {
                 warn!("Unsupported request type: {:?}", req.request_type);
                 NbdReply {
-                    handle: req.handle,
+                    cookie: req.cookie,
                     request_type: req.request_type,
                     reply_type: ReplyType::Error,
                     error_code: io::ErrorKind::Unsupported as u32,
@@ -64,7 +64,7 @@ impl MemoryBackend {
         debug!(offset, length, "Reading from storage");
 
         let mut reply = NbdReply {
-            handle: req.handle,
+            cookie: req.cookie,
             request_type: req.request_type,
             reply_type: ReplyType::Data,
             error_code: 0,
@@ -78,7 +78,7 @@ impl MemoryBackend {
         } else {
             reply.data = Some(Bytes::copy_from_slice(&self.data[offset..end]));
         }
-        tracing::trace!(handle = reply.handle, "Read reply prepared");
+        tracing::trace!(cookie = reply.cookie, "Read reply prepared");
         reply
     }
 
@@ -87,7 +87,7 @@ impl MemoryBackend {
         let offset = req.offset as usize;
         let length = req.length as usize;
         let mut reply = NbdReply {
-            handle: req.handle,
+            cookie: req.cookie,
             request_type: req.request_type,
             reply_type: ReplyType::Ack,
             error_code: 0,
@@ -118,7 +118,7 @@ impl MemoryBackend {
     pub fn flush(&mut self, req: &NbdRequest) -> NbdReply {
         debug!("Flushing storage (no-op)");
         NbdReply {
-            handle: req.handle,
+            cookie: req.cookie,
             request_type: req.request_type,
             reply_type: ReplyType::Ack,
             error_code: 0,
@@ -129,7 +129,7 @@ impl MemoryBackend {
     pub fn trim(&mut self, req: &NbdRequest) -> NbdReply {
         debug!("Trimming storage (no-op)");
         NbdReply {
-            handle: req.handle,
+            cookie: req.cookie,
             request_type: req.request_type,
             reply_type: ReplyType::Ack,
             error_code: 0,

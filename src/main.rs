@@ -42,7 +42,7 @@ async fn prepare_exports(registry: NbdExportRegistry) {
                 Some(req) => {
                     tracing::trace!(
                         "Received operation: handle={}, type={:?}, offset={}, length={}",
-                        req.handle,
+                        req.cookie,
                         req.request_type,
                         req.offset,
                         req.length
@@ -81,8 +81,8 @@ async fn prepare_exports(registry: NbdExportRegistry) {
             match req_rx.recv().await {
                 Some(req) => {
                     tracing::trace!(
-                        "Received operation: handle={}, type={:?}, offset={}, length={}",
-                        req.handle,
+                        "Received operation: cookie={}, type={:?}, offset={}, length={}",
+                        req.cookie,
                         req.request_type,
                         req.offset,
                         req.length

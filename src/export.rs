@@ -26,7 +26,7 @@ pub enum ReplyType {
 
 #[derive(Clone, Debug)]
 pub struct NbdRequest {
-    pub handle: u64,
+    pub cookie: u64,
     pub request_type: RequestType,
     pub offset: u64,
     pub length: u32,
@@ -35,7 +35,7 @@ pub struct NbdRequest {
 
 #[derive(Clone, Debug)]
 pub struct NbdReply {
-    pub handle: u64,
+    pub cookie: u64,
     pub request_type: RequestType,
     pub reply_type: ReplyType,
     pub error_code: u32,
@@ -43,9 +43,9 @@ pub struct NbdReply {
 }
 
 impl NbdRequest {
-    pub fn new_read(handle: u64, offset: u64, length: u32) -> Self {
+    pub fn new_read(cookie: u64, offset: u64, length: u32) -> Self {
         NbdRequest {
-            handle,
+            cookie,
             request_type: RequestType::Read,
             offset,
             length,
@@ -53,9 +53,9 @@ impl NbdRequest {
         }
     }
 
-    pub fn new_write(handle: u64, offset: u64, length: u32, data: Bytes) -> Self {
+    pub fn new_write(cookie: u64, offset: u64, length: u32, data: Bytes) -> Self {
         NbdRequest {
-            handle,
+            cookie,
             request_type: RequestType::Write,
             offset,
             length,
@@ -63,9 +63,9 @@ impl NbdRequest {
         }
     }
 
-    pub fn new_flush(handle: u64) -> Self {
+    pub fn new_flush(cookie: u64) -> Self {
         NbdRequest {
-            handle,
+            cookie,
             request_type: RequestType::Flush,
             offset: 0,
             length: 0,

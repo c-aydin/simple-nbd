@@ -297,7 +297,7 @@ pub async fn nbd_session(stream: TcpStream, registry: NbdExportRegistry) -> io::
             result = backend_receiver.recv() => {
                 match result {
                     Some(r) => {
-                        trace!("Received reply from backend: {}", r.handle);
+                        trace!("Received reply from backend: {}", r.cookie);
                         let reply_msg = reply_to_message(&r)?;
                         client_sender.send(reply_msg).await?;
                     },
@@ -319,46 +319,46 @@ pub async fn nbd_session(stream: TcpStream, registry: NbdExportRegistry) -> io::
 fn message_to_request(msg: &NbdMessage) -> io::Result<NbdRequest> {
     match msg {
         NbdMessage::CmdRead {
-            handle,
+            cookie,
             offset,
             length,
         } => Ok(NbdRequest {
-            handle: *handle,
+            cookie: *cookie,
             request_type: RequestType::Read,
             offset: *offset,
             length: *length,
             data: None,
         }),
         NbdMessage::CmdWrite {
-            handle,
+            cookie,
             offset,
             data,
         } => Ok(NbdRequest {
-            handle: *handle,
+            cookie: *cookie,
             request_type: RequestType::Write,
             offset: *offset,
             length: data.len() as u32,
             data: Some(data.clone()),
         }),
-        NbdMessage::CmdFlush { handle } => Ok(NbdRequest {
-            handle: *handle,
+        NbdMessage::CmdFlush { cookie } => Ok(NbdRequest {
+            cookie: *cookie,
             request_type: RequestType::Flush,
             offset: 0,
             length: 0,
             data: None,
         }),
         NbdMessage::CmdTrim {
-            handle,
+            cookie,
             offset,
             length,
         } => Ok(NbdRequest {
-            handle: *handle,
+            cookie: *cookie,
             request_type: RequestType::Trim,
             offset: *offset,
             length: *length,
             data: None,
         }),
-        NbdMessage::CmdDisc { handle: _ } => Err(io::Error::new(
+        NbdMessage::CmdDisc { cookie: _ } => Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "Client requested disconnect",
         )),
@@ -372,7 +372,7 @@ fn message_to_request(msg: &NbdMessage) -> io::Result<NbdRequest> {
 fn reply_to_message(reply: &NbdReply) -> io::Result<NbdMessage> {
     Ok(NbdMessage::CmdReply {
         error: reply.error_code,
-        handle: reply.handle,
+        cookie: reply.cookie,
         data: reply.data.clone(),
     })
 }
