@@ -255,7 +255,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "simple_nbd"
+name = "simple-nbd"
 version = "0.1.0"
 dependencies = [
  "bytes",
