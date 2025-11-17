@@ -1,13 +1,16 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio_util::codec::{Decoder, Encoder};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::constants::*;
 
 /// Codec internal states
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SessionState {
     /// Server: Waiting for the 4-byte client flags.
     ExpectClientFlags,
@@ -20,6 +23,31 @@ pub enum SessionState {
     /// Aborted
     Aborted,
 }
+
+impl SessionState {
+    fn as_u8(&self) -> u8 {
+        *self as u8
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => SessionState::ExpectClientFlags,
+            1 => SessionState::ExpectServerGreeting,
+            2 => SessionState::Haggling,
+            3 => SessionState::Transmission,
+            4 => SessionState::Aborted,
+            _ => SessionState::Aborted,
+        }
+    }
+}
+
+impl From<u8> for SessionState {
+    fn from(value: u8) -> Self {
+        SessionState::from_u8(value)
+    }
+}
+
+type ShareableState = Arc<AtomicU8>;
 
 /// Represents a single, logical NBD message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +75,11 @@ pub enum NbdMessage {
     ExportInfo {
         option_id: u32,
         request_type: u16,
+        size: u64,
+        flags: u16,
+    },
+
+    LegacyExportInfo {
         size: u64,
         flags: u16,
     },
@@ -81,11 +114,13 @@ pub enum NbdMessage {
 }
 
 pub struct NbdCodec {
-    state: SessionState,
+    state: ShareableState,
     /// We must store the length of pending READ requests
     /// to know how much data to expect in a CmdReply.
     /// Key: cookie, Value: length
     pending_reads: HashMap<u64, u32>,
+    /// Whether to add zeroes where appropriate if client does not support NO_ZEROES
+    add_zeroes: bool,
 }
 
 impl NbdCodec {
@@ -93,8 +128,9 @@ impl NbdCodec {
     pub fn new_server() -> Self {
         info!("Creating new NBD codec (Server-side)");
         Self {
-            state: SessionState::ExpectClientFlags,
+            state: Arc::new(AtomicU8::new(SessionState::ExpectClientFlags.as_u8())),
             pending_reads: HashMap::new(),
+            add_zeroes: false,
         }
     }
 
@@ -102,24 +138,37 @@ impl NbdCodec {
     pub fn new_client() -> Self {
         info!("Creating new NBD codec (Client-side)");
         Self {
-            state: SessionState::ExpectServerGreeting,
+            state: Arc::new(AtomicU8::new(SessionState::ExpectServerGreeting.as_u8())),
             pending_reads: HashMap::new(),
+            add_zeroes: false,
         }
     }
 
     pub fn state(&self) -> SessionState {
+        self.state.load(Ordering::SeqCst).into()
+    }
+
+    pub fn shareable_state(&self) -> ShareableState {
         self.state.clone()
+    }
+
+    pub fn set_state(&self, new_state: SessionState) {
+        self.state.store(new_state.as_u8(), Ordering::SeqCst);
+    }
+
+    pub fn set_shared_state(&mut self, new_state: ShareableState) {
+        self.state = new_state;
     }
 
     /// Helper to transition to the Transmission phase.
     fn transition_to_transmission(&mut self) {
         info!("Transitioning to Transmission phase. Handshake complete.");
-        self.state = SessionState::Transmission;
+        self.set_state(SessionState::Transmission);
     }
 
     fn transition_to_aborted(&mut self) {
         info!("Transitioning to Aborted state. Handshake aborted.");
-        self.state = SessionState::Aborted;
+        self.set_state(SessionState::Aborted);
     }
 }
 
@@ -183,6 +232,14 @@ impl Encoder<NbdMessage> for NbdCodec {
                 dst.put_u16(request_type); // 2 bytes
                 dst.put_u64(size); // 8 bytes
                 dst.put_u16(flags); // 2 bytes
+            }
+
+            NbdMessage::LegacyExportInfo { size, flags } => {
+                dst.put_u64(size); // 8 bytes
+                dst.put_u16(flags); // 2 bytes
+                dst.put_bytes(0, 124);
+
+                self.transition_to_transmission();
             }
 
             // --- Transmission: Requests ---
@@ -283,7 +340,7 @@ impl Decoder for NbdCodec {
 
         //tracing::trace!("Full server message({} bytes): {:?}", src.len(), src);
 
-        match self.state {
+        match self.state() {
             // --- Handshake States ---
             SessionState::ExpectServerGreeting => {
                 if src.len() < 18 {
@@ -299,7 +356,7 @@ impl Decoder for NbdCodec {
                 }
                 let flags = (&greeting[16..]).get_u16();
                 info!(?flags, "Received valid server greeting");
-                self.state = SessionState::Haggling;
+                self.set_state(SessionState::Haggling);
                 Ok(Some(NbdMessage::ServerGreeting { flags }))
             }
             SessionState::ExpectClientFlags => {
@@ -309,7 +366,17 @@ impl Decoder for NbdCodec {
                 }
                 let flags = src.split_to(4).get_u32();
                 info!(?flags, "Received client flags");
-                self.state = SessionState::Haggling;
+                self.set_state(SessionState::Haggling);
+                if flags & NBD_FLAG_C_FIXED_NEWSTYLE == 0 {
+                    warn!(?flags, "Client does not support fixed newstyle. Closing.");
+                }
+                if flags & NBD_FLAG_C_NO_ZEROES == 0 {
+                    warn!(
+                        ?flags,
+                        "Client did not set NO_ZEROES flag. Will try to add zeroes where appropriate."
+                    );
+                    self.add_zeroes = true;
+                }
                 Ok(Some(NbdMessage::ClientFlags { flags }))
             }
 
@@ -684,14 +751,14 @@ mod tests {
         // Client decodes
         let decoded = codec.decode(&mut buffer).expect("Decoding failed");
         assert_eq!(decoded, Some(greeting));
-        assert_eq!(codec.state, SessionState::Haggling); // State transitioned
+        assert_eq!(codec.state(), SessionState::Haggling); // State transitioned
         assert_eq!(buffer.len(), 0); // Buffer is empty
     }
 
     #[test]
     fn test_option_clanger_encode_decode() {
         let mut codec = NbdCodec::new_server();
-        codec.state = SessionState::Haggling; // Manually set for test
+        codec.set_state(SessionState::Haggling); // Manually set for test
         let mut buffer = BytesMut::new();
 
         // Client encodes
@@ -713,7 +780,7 @@ mod tests {
         // Server decodes
         let decoded = codec.decode(&mut buffer).expect("Decoding failed");
         assert_eq!(decoded, Some(clanger));
-        assert_eq!(codec.state, SessionState::Haggling); // State remains
+        assert_eq!(codec.state(), SessionState::Haggling); // State remains
         assert_eq!(buffer.len(), 0);
     }
 
@@ -721,7 +788,7 @@ mod tests {
     #[test]
     fn test_export_info_transition() {
         let mut codec = NbdCodec::new_client();
-        codec.state = SessionState::Haggling; // Client is haggling
+        codec.set_state(SessionState::Haggling); // Client is haggling
         let mut buffer = BytesMut::new();
 
         // Server encodes ExportInfo (transition message)
@@ -740,7 +807,7 @@ mod tests {
         // Client decodes
         let decoded = codec.decode(&mut buffer).expect("Decoding failed");
         assert_eq!(decoded, Some(export_info));
-        assert_eq!(codec.state, SessionState::Transmission); // STATE TRANSITIONED!
+        assert_eq!(codec.state(), SessionState::Transmission); // STATE TRANSITIONED!
         assert_eq!(buffer.len(), 0);
     }
 
@@ -748,7 +815,7 @@ mod tests {
     fn test_client_read_request_and_reply() {
         // --- Client perspective ---
         let mut client_codec = NbdCodec::new_client();
-        client_codec.state = SessionState::Transmission;
+        client_codec.set_state(SessionState::Transmission);
         let mut client_buf = BytesMut::new();
 
         // Client encodes a READ request
@@ -766,7 +833,7 @@ mod tests {
 
         // --- Server perspective ---
         let mut server_codec = NbdCodec::new_server();
-        server_codec.state = SessionState::Transmission;
+        server_codec.set_state(SessionState::Transmission);
 
         // Server decodes the client's buffer
         let decoded_req = server_codec.decode(&mut client_buf).unwrap().unwrap();
@@ -798,7 +865,7 @@ mod tests {
     fn test_client_write_request_and_reply() {
         // --- Client perspective ---
         let mut client_codec = NbdCodec::new_client();
-        client_codec.state = SessionState::Transmission;
+        client_codec.set_state(SessionState::Transmission);
         let mut client_buf = BytesMut::new();
 
         // Client encodes a WRITE request
@@ -818,7 +885,7 @@ mod tests {
 
         // --- Server perspective ---
         let mut server_codec = NbdCodec::new_server();
-        server_codec.state = SessionState::Transmission;
+        server_codec.set_state(SessionState::Transmission);
 
         // Server decodes the client's buffer
         let decoded_req = server_codec.decode(&mut client_buf).unwrap().unwrap();

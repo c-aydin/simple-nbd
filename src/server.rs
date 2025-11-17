@@ -39,11 +39,13 @@ pub async fn listen(addr: SocketAddrV6, registry: NbdExportRegistry) -> Result<(
 
 /// Handle a single NBD client connection
 pub async fn nbd_session(stream: TcpStream, registry: NbdExportRegistry) -> io::Result<()> {
-    // Wrap the TCP stream with our NBD codec
+    // Framed doesn't share encoder/decoder so use shared state to ensure coherence
     let (client_rx, client_tx) = tokio::io::split(stream);
-    let codec = NbdCodec::new_server();
-    let mut client_receiver = Framed::new(client_rx, codec);
-    let mut client_sender = Framed::new(client_tx, NbdCodec::new_server());
+    let decoder = NbdCodec::new_server();
+    let mut encoder = NbdCodec::new_server();
+    encoder.set_shared_state(decoder.shareable_state());
+    let mut client_receiver = Framed::new(client_rx, decoder);
+    let mut client_sender = Framed::new(client_tx, encoder);
 
     // --- 1. Handshake Phase ---
     // The codec handles the first part (ExpectClientFlags)
@@ -51,7 +53,7 @@ pub async fn nbd_session(stream: TcpStream, registry: NbdExportRegistry) -> io::
     debug!("Sending ServerGreeting");
     client_sender
         .send(NbdMessage::ServerGreeting {
-            flags: NBD_FLAG_FIXED_NEWSTYLE,
+            flags: NBD_FLAG_FIXED_NEWSTYLE | NBD_FLAG_NO_ZEROES,
         })
         .await?;
 
@@ -68,11 +70,17 @@ pub async fn nbd_session(stream: TcpStream, registry: NbdExportRegistry) -> io::
     };
 
     if let NbdMessage::ClientFlags { flags } = client_flags_msg {
-        if flags != NBD_FLAG_C_FIXED_NEWSTYLE {
+        if flags & NBD_FLAG_C_FIXED_NEWSTYLE == 0 {
             warn!(?flags, "Client does not support fixed newstyle. Closing.");
             return Ok(());
         }
         debug!("Client supports fixed newstyle");
+        if flags & NBD_FLAG_C_NO_ZEROES == 0 {
+            warn!(
+                ?flags,
+                "Client did not set NO_ZEROES flag, this could get weird."
+            );
+        }
     } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -129,13 +137,38 @@ pub async fn nbd_session(stream: TcpStream, registry: NbdExportRegistry) -> io::
                             .await?;
                     }
                     NBD_OPT_EXPORT_NAME => {
-                        warn!("Client sent legacy NBD_OPT_EXPORT_NAME, which is unsupported");
-                        // Yes this is technically a protocol violation, but it be what it be
+                        debug!("Client requested export name");
+                        export_name = String::from_utf8_lossy(&data).to_string();
+                        let export = registry.get_export(&export_name).await;
+                        let export = match export {
+                            Some(exp) => exp,
+                            None => {
+                                warn!(?export_name, "Client requested unknown export name");
+                                // Send error reply
+                                client_sender
+                                    .send(NbdMessage::SimpleReply {
+                                        option_id: NBD_OPT_GO,
+                                        reply_type: NBD_REP_ERR_UNKNOWN,
+                                        data: Bytes::new(),
+                                    })
+                                    .await?;
+                                continue;
+                            }
+                        };
+                        tracing::info!(?export_name, "Client export OK");
+                        // All good
+                        // client_sender
+                        //     .send(NbdMessage::SimpleReply {
+                        //         option_id: NBD_OPT_EXPORT_NAME,
+                        //         reply_type: NBD_REP_ACK,
+                        //         data: Bytes::new(),
+                        //     })
+                        //     .await?;
+
                         client_sender
-                            .send(NbdMessage::SimpleReply {
-                                option_id: NBD_OPT_EXPORT_NAME,
-                                reply_type: NBD_REP_ERR_UNSUP,
-                                data: Bytes::new(),
+                            .send(NbdMessage::LegacyExportInfo {
+                                size: export.spec.size,
+                                flags: export.spec.flags,
                             })
                             .await?;
                     }
